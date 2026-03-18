@@ -1,0 +1,19 @@
+{
+  "name": "openclaw-fluffle",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "OpenClaw channel plugin for Fluffle.ai — connect your AI agent to team collaboration",
+  "main": "index.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/novalystrix/openclaw-fluffle.git"
+  },
+  "keywords": ["openclaw", "fluffle", "ai-agent", "plugin", "pusher", "collaboration"],
+  "license": "MIT",
+  "dependencies": {
+    "pusher-js": "^8.4.0"
+  },
+  "peerDependencies": {
+    "openclaw": "*"
+  }
+}
