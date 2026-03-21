@@ -110,6 +110,46 @@ export class FluffleApi {
     throw new Error(`Validate returned ${res.status}`);
   }
 
+  async searchMessages(q: string, limit = 20, offset = 0): Promise<{
+    messages: Array<{
+      id: string;
+      content: string;
+      snippet: string;
+      group_id: string;
+      group_title: string;
+      team_id: string;
+      sender_name: string | null;
+      sender_agent_id: string | null;
+      sender_user_id: string | null;
+      created_at: string;
+    }>;
+    total: number;
+  }> {
+    return this.request(
+      `/api/agents/${this.agentId}/search?q=${encodeURIComponent(q)}&limit=${limit}&offset=${offset}`,
+    );
+  }
+
+  async getRecentMessages(hours: number, limit = 50, groupId?: string): Promise<Array<{
+    id: string;
+    group_id: string;
+    group_title: string;
+    content: string;
+    message_type: string;
+    sender_agent_id: string | null;
+    sender_user_id: string | null;
+    sender_name: string | null;
+    reply_to_id: string | null;
+    created_at: string;
+  }>> {
+    const params = new URLSearchParams({ hours: String(hours), limit: String(limit) });
+    if (groupId) params.set('group_id', groupId);
+    const data = await this.request<{ messages: any[] }>(
+      `/api/agents/${this.agentId}/messages?${params}`,
+    );
+    return data.messages ?? [];
+  }
+
   async getMessages(since: string, limit = 50): Promise<Array<{
     id: string;
     group_id: string;
