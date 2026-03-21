@@ -28,11 +28,45 @@ export class FluffleApi {
     return res.json() as Promise<T>;
   }
 
+  async sendTyping(groupId: string): Promise<void> {
+    await this.request(`/api/groups/${groupId}/typing`, { method: "POST" }).catch(() => {});
+  }
+
   async sendMessage(groupId: string, content: string): Promise<{ id: string }> {
     return this.request<{ id: string }>(`/api/groups/${groupId}/messages`, {
       method: "POST",
       body: JSON.stringify({ content, message_type: "text" }),
     });
+  }
+
+  async createStreamingMessage(groupId: string): Promise<{ id: string }> {
+    const data = await this.request<{ message: { id: string } }>(`/api/groups/${groupId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "", message_type: "text", streaming: true }),
+    });
+    return { id: data.message.id };
+  }
+
+  async sendStreamChunk(groupId: string, messageId: string, chunk: string): Promise<void> {
+    await this.request(`/api/groups/${groupId}/messages/${messageId}/stream`, {
+      method: "POST",
+      body: JSON.stringify({ chunk }),
+    });
+  }
+
+  async finalizeStream(groupId: string, messageId: string): Promise<void> {
+    await this.request(`/api/groups/${groupId}/messages/${messageId}/stream`, {
+      method: "POST",
+      body: JSON.stringify({ done: true }),
+    });
+  }
+
+  async sendThinkingMessage(groupId: string): Promise<{ id: string }> {
+    const data = await this.request<{ message: { id: string } }>(`/api/groups/${groupId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "", message_type: "thinking" }),
+    });
+    return { id: data.message.id };
   }
 
   async getGroups(): Promise<Array<{ id: string; title: string; team_id: string }>> {
@@ -52,6 +86,56 @@ export class FluffleApi {
       method: "POST",
       body: JSON.stringify({ status: "online" }),
     });
+  }
+
+  /**
+   * Check if this agent still exists on Fluffle.
+   * Returns { exists, reason? } — only trust the result if the request succeeds.
+   * On network error / 5xx, throws (caller should treat as "unknown").
+   */
+  async validateAgent(): Promise<{ exists: boolean; reason?: string }> {
+    const url = `${this.baseUrl}/api/agents/${this.agentId}/validate`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${this.apiKey}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    // 200 = exists, 401/404/410 = explicit "you're gone"
+    if (res.ok) {
+      return res.json() as Promise<{ exists: boolean }>;
+    }
+    if (res.status === 401 || res.status === 404 || res.status === 410) {
+      return res.json() as Promise<{ exists: boolean; reason: string }>;
+    }
+    // 5xx or anything else = can't tell, throw so caller retries
+    throw new Error(`Validate returned ${res.status}`);
+  }
+
+  async getMessages(since: string, limit = 50): Promise<Array<{
+    id: string;
+    group_id: string;
+    team_id: string;
+    sender_user_id?: string;
+    sender_agent_id?: string;
+    sender_name?: string;
+    sender_type?: string;
+    content: string;
+    message_type?: string;
+    created_at: string;
+    reply_to?: string | null;
+  }>> {
+    const data = await this.request<{ messages: any[] }>(
+      `/api/agents/${this.agentId}/messages?since=${encodeURIComponent(since)}&limit=${limit}`,
+    );
+    return data.messages ?? [];
+  }
+
+  async getPlaybook(teamId: string): Promise<{ version: number; content: string } | null> {
+    const res = await fetch(`${this.baseUrl}/api/teams/${teamId}/playbook`, {
+      headers: { Authorization: `Bearer ${this.apiKey}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json() as { playbook?: { version: number; content: string } | null };
+    return data.playbook ? { version: data.playbook.version, content: data.playbook.content } : null;
   }
 
   async pusherAuth(socketId: string, channelName: string): Promise<{ auth: string }> {

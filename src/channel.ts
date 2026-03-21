@@ -58,7 +58,7 @@ export const fluffleDock: ChannelDock = {
   id: "fluffle",
   capabilities: {
     chatTypes: ["direct", "group"],
-    media: false,
+    media: true,
     blockStreaming: false,
   },
   outbound: { textChunkLimit: 4096 },
@@ -82,7 +82,7 @@ export const flufflePlugin: ChannelPlugin<ResolvedFluffleAccount> = {
   meta,
   capabilities: {
     chatTypes: ["direct", "group"],
-    media: false,
+    media: true,
     reactions: false,
     threads: false,
     polls: false,

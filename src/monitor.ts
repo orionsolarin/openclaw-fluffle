@@ -25,6 +25,9 @@ import type {
 const TEXT_LIMIT = 4096;
 const MAX_TIMESTAMP_AGE_SECONDS = 300;
 
+// Per-team playbook cache (module-level, persists across messages)
+const playbookCache = new Map<string, { version: number; content: string }>();
+
 export type FluffleMonitorOptions = {
   account: ResolvedFluffleAccount;
   config: OpenClawConfig;
@@ -108,6 +111,10 @@ function parseWebhookPayload(payload: WebhookPayload): FluffleInboundMessage {
           senderName: payload.message.reply_to.sender_name,
         }
       : null,
+    fileId: payload.message.file_id ?? null,
+    fileName: payload.message.file_name ?? null,
+    fileMimeType: payload.message.file_mime_type ?? null,
+    playbook: payload.playbook,
   };
 }
 
@@ -124,7 +131,7 @@ async function processMessage(
   // Skip messages from our own agent
   if (message.senderType === "agent" && message.senderId === account.config.agentId) return;
 
-  runtime.log?.(`[fluffle] processMessage: from=${message.senderName} content="${message.content?.slice(0, 50)}" groupId=${message.groupId}`);
+  runtime.log?.(`[fluffle] processMessage: from=${message.senderName} content="${message.content?.slice(0, 50)}" groupId=${message.groupId} fileId=${message.fileId ?? "none"} fileName=${message.fileName ?? "none"}`);
 
   const pairing = createScopedPairingAccess({
     core,
@@ -139,8 +146,34 @@ async function processMessage(
   const isGroup = true;
   const rawBody = message.content.trim();
 
+  // ── Playbook cache: fetch if version changed ────────────────────────────
+  let playbookContent: string | undefined;
+  if (message.playbook?.version !== undefined) {
+    const cached = playbookCache.get(message.teamId);
+    if (!cached || cached.version !== message.playbook.version) {
+      try {
+        const playbookApi = new FluffleApi(account);
+        const pb = await playbookApi.getPlaybook(message.teamId);
+        if (pb) {
+          playbookCache.set(message.teamId, pb);
+          playbookContent = pb.content;
+        }
+      } catch (err) {
+        runtime.log?.(`[fluffle] Failed to fetch playbook: ${String(err)}`);
+      }
+    } else {
+      playbookContent = cached.content;
+    }
+  } else {
+    // No version in message — use cached content if available
+    const cached = playbookCache.get(message.teamId);
+    if (cached) playbookContent = cached.content;
+  }
+
   const defaultGroupPolicy = resolveDefaultGroupPolicy(config);
-  const providerConfigPresent = (config.channels as any)?.["fluffle"] !== undefined;
+  // Fluffle is a plugin, not a built-in channel — config lives in plugins.entries.fluffle
+  // so we always treat it as "configured" when the monitor is running
+  const providerConfigPresent = true;
   const { groupPolicy } = resolveOpenProviderRuntimeGroupPolicy({
     providerConfigPresent,
     groupPolicy: account.config.groupPolicy,
@@ -196,14 +229,30 @@ async function processMessage(
     storePath,
     sessionKey: route.sessionKey,
   });
+  // Prepend playbook if available
+  const cachedPlaybook = playbookCache.get(message.teamId);
+  const effectiveBody = playbookContent
+    ? `[Team Playbook - v${cachedPlaybook?.version ?? '?'}]\n${playbookContent}\n[End Playbook]\n\n${rawBody}`
+    : rawBody;
+
   const body = core.channel.reply.formatAgentEnvelope({
     channel: "Fluffle",
     from: message.senderName || `${message.senderType}:${message.senderId}`,
     timestamp: new Date(message.createdAt).getTime(),
     previousTimestamp,
     envelope: envelopeOptions,
-    body: rawBody,
+    body: effectiveBody,
   });
+
+  // Resolve file attachment media URL if present
+  const fileMediaUrl = message.fileId
+    ? `${account.config.baseUrl}/api/files/${message.fileId}`
+    : undefined;
+  const fileMediaType = message.fileMimeType || undefined;
+
+  if (message.fileId) {
+    runtime.log?.(`[fluffle] File attachment detected: fileId=${message.fileId} fileName=${message.fileName} mediaUrl=${fileMediaUrl}`);
+  }
 
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: body,
@@ -224,7 +273,13 @@ async function processMessage(
     MessageSid: message.id,
     OriginatingChannel: "fluffle",
     OriginatingTo: `fluffle:${message.groupId}`,
+    ...(fileMediaUrl ? { MediaUrl: fileMediaUrl, NumMedia: "1" } : {}),
+    ...(fileMediaType ? { MediaType: fileMediaType } : {}),
   });
+
+  // Send typing indicator — we got the message and are working on a reply
+  const typingApi = new FluffleApi(account);
+  typingApi.sendTyping(message.groupId).catch(() => {});
 
   await core.channel.session.recordInboundSession({
     storePath,
@@ -242,12 +297,25 @@ async function processMessage(
     accountId: account.accountId,
   });
 
+  // ── Typing heartbeat while LLM is processing ──────────────────────────────
+  const streamApi = new FluffleApi(account);
+  let typingInterval: ReturnType<typeof setInterval> | null = null;
+
+  // Keep "..." visible while thinking/processing
+  typingInterval = setInterval(() => {
+    streamApi.sendTyping(message.groupId).catch(() => {});
+  }, 3000);
+  streamApi.sendTyping(message.groupId).catch(() => {});
+
   await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: ctxPayload,
     cfg: config,
     dispatcherOptions: {
       ...prefixOptions,
       deliver: async (payload) => {
+        // Stop typing heartbeat on delivery
+        if (typingInterval) { clearInterval(typingInterval); typingInterval = null; }
+
         await deliverReply({
           payload: payload as OutboundReplyPayload,
           groupId: message.groupId,
@@ -256,6 +324,7 @@ async function processMessage(
           config,
           accountId: account.accountId,
           statusSink,
+          streamApi,
         });
       },
       onError: (err, info) => {
@@ -264,6 +333,9 @@ async function processMessage(
     },
     replyOptions: { onModelSelected },
   });
+
+  // Cleanup typing interval
+  if (typingInterval) { clearInterval(typingInterval); typingInterval = null; }
 }
 
 // ─── Deliver outbound reply ─────────────────────────────────────────────────
@@ -276,8 +348,9 @@ async function deliverReply(params: {
   config: OpenClawConfig;
   accountId?: string;
   statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void;
+  streamApi?: FluffleApi;
 }): Promise<void> {
-  const { payload, groupId, runtime, core, config, accountId, statusSink } = params;
+  const { payload, groupId, runtime, core, config, accountId, statusSink, streamApi } = params;
   const text = payload.text ?? "";
 
   const sentMedia = await sendMediaWithLeadingCaption({
@@ -295,7 +368,33 @@ async function deliverReply(params: {
   });
   if (sentMedia) return;
 
-  if (text) {
+  if (text && streamApi) {
+    // Stream the final response text via Fluffle's streaming API
+    try {
+      const { id: msgId } = await streamApi.createStreamingMessage(groupId);
+      // Send the text in small chunks for a streaming effect
+      const CHUNK_SIZE = 80; // ~80 chars per chunk
+      for (let i = 0; i < text.length; i += CHUNK_SIZE) {
+        const chunk = text.slice(i, i + CHUNK_SIZE);
+        await streamApi.sendStreamChunk(groupId, msgId, chunk);
+        // Small delay between chunks for visual effect
+        if (i + CHUNK_SIZE < text.length) {
+          await new Promise(r => setTimeout(r, 50));
+        }
+      }
+      await streamApi.finalizeStream(groupId, msgId);
+      statusSink?.({ lastOutboundAt: Date.now() });
+    } catch (err) {
+      runtime.error?.(`[fluffle] streaming delivery failed, falling back: ${String(err)}`);
+      // Fallback: send as regular message
+      try {
+        await sendMessageFluffle(groupId, text);
+        statusSink?.({ lastOutboundAt: Date.now() });
+      } catch (e2) {
+        runtime.error(`fluffle message send failed: ${String(e2)}`);
+      }
+    }
+  } else if (text) {
     const chunkMode = core.channel.text.resolveChunkMode(config, "fluffle", accountId);
     const chunks = core.channel.text.chunkMarkdownTextWithMode(text, TEXT_LIMIT, chunkMode);
     for (const chunk of chunks) {
@@ -370,6 +469,73 @@ async function startPusherListener(
 
   const api = new FluffleApi(account);
 
+  // Track last-seen message time for catch-up polling on reconnect
+  let lastMessageAt: string = new Date().toISOString();
+  const seenMessageIds = new Set<string>();
+  const MAX_SEEN_IDS = 500;
+  let isReconnect = false;
+
+  function trackMessage(id: string, createdAt?: string) {
+    if (id) {
+      seenMessageIds.add(id);
+      if (seenMessageIds.size > MAX_SEEN_IDS) {
+        const iter = seenMessageIds.values();
+        for (let i = 0; i < 100; i++) iter.next();
+        // trim oldest 100
+        const keep = new Set<string>();
+        for (const v of seenMessageIds) {
+          if (keep.size >= MAX_SEEN_IDS - 100) break;
+          keep.add(v);
+        }
+        seenMessageIds.clear();
+        for (const v of keep) seenMessageIds.add(v);
+      }
+    }
+    if (createdAt && createdAt > lastMessageAt) {
+      lastMessageAt = createdAt;
+    }
+  }
+
+  async function catchUpMissedMessages() {
+    try {
+      runtime.log?.(`[fluffle] Catching up missed messages since ${lastMessageAt}`);
+      const missed = await api.getMessages(lastMessageAt, 50);
+      let processed = 0;
+      for (const msg of missed) {
+        if (msg.id && seenMessageIds.has(msg.id)) continue;
+        // Skip own messages
+        if (msg.sender_agent_id === account.config.agentId) {
+          trackMessage(msg.id, msg.created_at);
+          continue;
+        }
+        const message: FluffleInboundMessage = {
+          id: msg.id ?? "",
+          groupId: msg.group_id ?? "",
+          teamId: msg.team_id ?? "",
+          senderId: msg.sender_user_id ?? msg.sender_agent_id ?? "",
+          senderName: msg.sender_name ?? "",
+          senderType: msg.sender_agent_id ? "agent" : (msg.sender_type ?? "user"),
+          content: msg.content ?? "",
+          messageType: msg.message_type ?? "text",
+          createdAt: msg.created_at ?? new Date().toISOString(),
+          replyTo: msg.reply_to ?? null,
+          fileId: msg.file_id ?? null,
+          fileName: msg.file_name ?? null,
+          fileMimeType: msg.file_mime_type ?? null,
+        };
+        trackMessage(msg.id, msg.created_at);
+        statusSink?.({ lastInboundAt: Date.now() });
+        await processMessage(message, account, config, core, runtime, statusSink).catch((err) => {
+          runtime.error(`[fluffle] Failed to process catch-up message: ${String(err)}`);
+        });
+        processed++;
+      }
+      runtime.log?.(`[fluffle] Catch-up complete: ${processed} new message(s) from ${missed.length} fetched`);
+    } catch (err) {
+      runtime.error?.(`[fluffle] Catch-up polling failed: ${String(err)}`);
+    }
+  }
+
   // Dynamic import pusher-js
   const PusherModule = await import("pusher-js");
   const Pusher = PusherModule.default ?? PusherModule;
@@ -386,7 +552,11 @@ async function startPusherListener(
   });
 
   pusher.connection.bind("connected", () => {
-    runtime.log?.(`[fluffle] Pusher connected`);
+    runtime.log?.(`[fluffle] Pusher connected${isReconnect ? " (reconnect — catching up)" : ""}`);
+    if (isReconnect) {
+      catchUpMissedMessages();
+    }
+    isReconnect = true; // subsequent connects are reconnects
   });
 
   pusher.connection.bind("error", (err: unknown) => {
@@ -405,7 +575,9 @@ async function startPusherListener(
       message: payload.message,
       recipient_agent: payload.recipient_agent,
       teammates: payload.teammates,
+      playbook: payload.playbook,
     });
+    trackMessage(message.id, message.createdAt);
     statusSink?.({ lastInboundAt: Date.now() });
     processMessage(message, account, config, core, runtime, statusSink).catch((err) => {
       runtime.error(`[fluffle] Failed to process Pusher message: ${String(err)}`);
@@ -431,7 +603,11 @@ async function startPusherListener(
           messageType: data.message_type ?? "text",
           createdAt: data.created_at ?? new Date().toISOString(),
           replyTo: data.reply_to ?? null,
+          fileId: data.file_id ?? null,
+          fileName: data.file_name ?? null,
+          fileMimeType: data.file_mime_type ?? null,
         };
+        trackMessage(message.id, message.createdAt);
         statusSink?.({ lastInboundAt: Date.now() });
         processMessage(message, account, config, core, runtime, statusSink).catch((err) => {
           runtime.error(`[fluffle] Failed to process Pusher group message: ${String(err)}`);
@@ -443,13 +619,51 @@ async function startPusherListener(
     runtime.error?.(`[fluffle] Failed to fetch groups for Pusher: ${String(err)}`);
   }
 
+  // ─── Agent validation on persistent errors ─────────────────────────────
+  let consecutiveHeartbeatErrors = 0;
+
+  async function checkAgentStillExists(): Promise<boolean> {
+    try {
+      const result = await api.validateAgent();
+      if (!result.exists) {
+        runtime.error?.(`[fluffle] Agent confirmed removed from Fluffle (reason: ${result.reason}). Shutting down plugin.`);
+        // Notify user via other channels
+        try {
+          const msg = `⚠️ My Fluffle agent has been removed or my API key was revoked (reason: ${result.reason}). The Fluffle plugin is now disabled.`;
+          core.channel.injectSystemEvent?.(msg);
+        } catch (_) { /* best effort */ }
+        return false;
+      }
+      return true;
+    } catch (_) {
+      // Can't reach Fluffle validate endpoint — treat as "unknown", keep going
+      runtime.log?.(`[fluffle] Could not validate agent (Fluffle may be down), continuing...`);
+      return true;
+    }
+  }
+
   // Heartbeat
   await api.heartbeat().catch(() => {});
   const heartbeatInterval = setInterval(async () => {
     try {
       await api.heartbeat();
+      consecutiveHeartbeatErrors = 0;
     } catch (err) {
-      runtime.error?.(`[fluffle] Heartbeat failed: ${String(err)}`);
+      consecutiveHeartbeatErrors++;
+      runtime.error?.(`[fluffle] Heartbeat failed (${consecutiveHeartbeatErrors}x): ${String(err)}`);
+
+      // After 3 consecutive failures, ask Fluffle directly if we still exist
+      if (consecutiveHeartbeatErrors >= 3) {
+        const stillExists = await checkAgentStillExists();
+        if (!stillExists) {
+          clearInterval(heartbeatInterval);
+          pusher.disconnect();
+          runtime.log?.(`[fluffle] Plugin stopped — agent no longer exists on Fluffle`);
+          return;
+        }
+        // Reset counter — Fluffle confirmed we exist, just having transient issues
+        consecutiveHeartbeatErrors = 0;
+      }
     }
   }, 30_000);
 

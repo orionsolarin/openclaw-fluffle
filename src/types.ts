@@ -63,6 +63,9 @@ export type WebhookPayload = {
     message_type: string;
     created_at: string;
     reply_to?: { id: string; content: string; sender_name: string } | null;
+    file_id?: string | null;
+    file_name?: string | null;
+    file_mime_type?: string | null;
   };
   recipient_agent?: {
     role: string | null;
@@ -70,6 +73,7 @@ export type WebhookPayload = {
     attitude: string | null;
   };
   teammates?: Array<{ name: string; role: string | null }>;
+  playbook?: { version: number };
 };
 
 export type FluffleInboundMessage = {
@@ -83,4 +87,8 @@ export type FluffleInboundMessage = {
   messageType: string;
   createdAt: string;
   replyTo?: { id: string; content: string; senderName: string } | null;
+  fileId?: string | null;
+  fileName?: string | null;
+  fileMimeType?: string | null;
+  playbook?: { version: number };
 };
