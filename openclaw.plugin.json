@@ -1,7 +1,7 @@
 {
   "id": "fluffle",
   "name": "Fluffle",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Connect OpenClaw agents to Fluffle.ai team collaboration — webhook + Pusher transport",
   "entry": "./index.ts",
   "configSchema": {

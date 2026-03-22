@@ -584,35 +584,64 @@ async function startPusherListener(
     });
   });
 
-  // Fetch and subscribe to group channels
+  // ─── Group subscription with dynamic refresh ──────────────────────────────
+  const subscribedGroupIds = new Set<string>();
+
+  function subscribeToGroup(group: { id: string; title: string; team_id: string }) {
+    if (subscribedGroupIds.has(group.id)) return;
+    subscribedGroupIds.add(group.id);
+
+    const channel = pusher.subscribe(`private-group-${group.id}`);
+    channel.bind("message:new", (data: any) => {
+      runtime.log?.(`[fluffle] Pusher group message received: ${JSON.stringify(data).slice(0, 300)}`);
+      if (data.sender_agent_id === account.config.agentId) return;
+      const message: FluffleInboundMessage = {
+        id: data.id ?? "",
+        groupId: group.id,
+        teamId: group.team_id ?? "",
+        senderId: data.sender_user_id ?? data.sender_agent_id ?? data.sender_id ?? data.sender?.id ?? "",
+        senderName: data.sender_name ?? data.sender?.name ?? "",
+        senderType: data.sender_agent_id ? "agent" : (data.sender_type ?? "user"),
+        content: data.content ?? "",
+        messageType: data.message_type ?? "text",
+        createdAt: data.created_at ?? new Date().toISOString(),
+        replyTo: data.reply_to ?? null,
+        fileId: data.file_id ?? null,
+        fileName: data.file_name ?? null,
+        fileMimeType: data.file_mime_type ?? null,
+      };
+      trackMessage(message.id, message.createdAt);
+      statusSink?.({ lastInboundAt: Date.now() });
+      processMessage(message, account, config, core, runtime, statusSink).catch((err) => {
+        runtime.error(`[fluffle] Failed to process Pusher group message: ${String(err)}`);
+      });
+    });
+    runtime.log?.(`[fluffle] Subscribed to group: ${group.title} (${group.id}) [team: ${group.team_id}]`);
+  }
+
+  async function refreshGroupSubscriptions() {
+    try {
+      const groups = await api.getGroups();
+      let newCount = 0;
+      for (const group of groups) {
+        if (!subscribedGroupIds.has(group.id)) {
+          subscribeToGroup(group);
+          newCount++;
+        }
+      }
+      if (newCount > 0) {
+        runtime.log?.(`[fluffle] Group refresh: subscribed to ${newCount} new group(s), total: ${subscribedGroupIds.size}`);
+      }
+    } catch (err) {
+      runtime.error?.(`[fluffle] Failed to refresh groups: ${String(err)}`);
+    }
+  }
+
+  // Initial group subscription
   try {
     const groups = await api.getGroups();
     for (const group of groups) {
-      const channel = pusher.subscribe(`private-group-${group.id}`);
-      channel.bind("message:new", (data: any) => {
-        runtime.log?.(`[fluffle] Pusher group message received: ${JSON.stringify(data).slice(0, 300)}`);
-        if (data.sender_agent_id === account.config.agentId) return;
-        const message: FluffleInboundMessage = {
-          id: data.id ?? "",
-          groupId: group.id,
-          teamId: group.team_id ?? "",
-          senderId: data.sender_user_id ?? data.sender_agent_id ?? data.sender_id ?? data.sender?.id ?? "",
-          senderName: data.sender_name ?? data.sender?.name ?? "",
-          senderType: data.sender_agent_id ? "agent" : (data.sender_type ?? "user"),
-          content: data.content ?? "",
-          messageType: data.message_type ?? "text",
-          createdAt: data.created_at ?? new Date().toISOString(),
-          replyTo: data.reply_to ?? null,
-          fileId: data.file_id ?? null,
-          fileName: data.file_name ?? null,
-          fileMimeType: data.file_mime_type ?? null,
-        };
-        trackMessage(message.id, message.createdAt);
-        statusSink?.({ lastInboundAt: Date.now() });
-        processMessage(message, account, config, core, runtime, statusSink).catch((err) => {
-          runtime.error(`[fluffle] Failed to process Pusher group message: ${String(err)}`);
-        });
-      });
+      subscribeToGroup(group);
     }
     runtime.log?.(`[fluffle] Subscribed to ${groups.length} group channel(s) via Pusher`);
   } catch (err) {
@@ -642,12 +671,20 @@ async function startPusherListener(
     }
   }
 
-  // Heartbeat
+  // Heartbeat + periodic group refresh
+  let heartbeatCount = 0;
   await api.heartbeat().catch(() => {});
   const heartbeatInterval = setInterval(async () => {
+    heartbeatCount++;
     try {
       await api.heartbeat();
       consecutiveHeartbeatErrors = 0;
+
+      // Refresh group subscriptions every 5 heartbeats (~2.5 min)
+      // This picks up new teams/groups the agent was added to after startup
+      if (heartbeatCount % 5 === 0) {
+        await refreshGroupSubscriptions();
+      }
     } catch (err) {
       consecutiveHeartbeatErrors++;
       runtime.error?.(`[fluffle] Heartbeat failed (${consecutiveHeartbeatErrors}x): ${String(err)}`);
@@ -672,7 +709,7 @@ async function startPusherListener(
     () => {
       clearInterval(heartbeatInterval);
       pusher.disconnect();
-      runtime.log?.(`[fluffle] Pusher disconnected`);
+      runtime.log?.(`[fluffle] Pusher disconnected (was tracking ${subscribedGroupIds.size} groups)`);
     },
     { once: true },
   );

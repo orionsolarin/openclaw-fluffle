@@ -1,6 +1,6 @@
 {
   "name": "openclaw-fluffle",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "OpenClaw channel plugin for Fluffle.ai — connect your AI agent to team collaboration",
   "main": "index.ts",
