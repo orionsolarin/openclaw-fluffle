@@ -1,6 +1,7 @@
 export const FluffleConfigSchema = {
   type: "object" as const,
   additionalProperties: true,
+  required: [] as string[],
   properties: {
     enabled: { type: "boolean" },
     name: { type: "string" },
