@@ -732,7 +732,8 @@ async function startPusherListener(
     if (subscribedGroups.has(groupId)) return;
     subscribedGroups.add(groupId);
     const channel = pusher.subscribe(`private-group-${groupId}`);
-    channel.bind("message:new", (data: any) => {
+    // Listen for both 'message:created' (new server) and 'message:new' (legacy) — dedup handles duplicates
+    const groupMessageHandler = (data: any) => {
       runtime.log?.(`[fluffle] Pusher group message received: ${JSON.stringify(data).slice(0, 300)}`);
       if (data.sender_agent_id === account.config.agentId) return;
       const message: FluffleInboundMessage = {
@@ -759,7 +760,9 @@ async function startPusherListener(
       processMessage(message, account, config, core, runtime, statusSink).catch((err) => {
         runtime.error(`[fluffle] Failed to process Pusher group message: ${String(err)}`);
       });
-    });
+    };
+    channel.bind("message:new", groupMessageHandler);
+    channel.bind("message:created", groupMessageHandler);
   }
 
   async function refreshGroupSubscriptions() {
