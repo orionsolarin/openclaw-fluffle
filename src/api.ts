@@ -129,6 +129,18 @@ export class FluffleApi {
     return data.messages ?? [];
   }
 
+  async getTeamContext(teamId: string): Promise<{
+    channelDigest?: Array<{ channelName: string; channelType: string; recentMessages: Array<{ senderName: string; content: string; createdAt: string }> }>;
+    projectState?: Array<{ projectName: string; columns: Array<{ title: string; tasks: Array<{ title: string; assignee: string; priority: string }> }> }>;
+    playbook?: { version: number; content: string };
+  } | null> {
+    try {
+      return await this.request(`/api/teams/${teamId}/context`);
+    } catch {
+      return null;
+    }
+  }
+
   async getPlaybook(teamId: string): Promise<{ version: number; content: string } | null> {
     const res = await fetch(`${this.baseUrl}/api/teams/${teamId}/playbook`, {
       headers: { Authorization: `Bearer ${this.apiKey}` },

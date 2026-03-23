@@ -68,11 +68,15 @@ export type WebhookPayload = {
     file_mime_type?: string | null;
   };
   recipient_agent?: {
+    id?: string;
+    name?: string;
     role: string | null;
-    directives: string | null;
-    attitude: string | null;
+    directives?: string | null;
+    attitude?: string | null;
   };
-  teammates?: Array<{ name: string; role: string | null }>;
+  teammates?: Array<{ id?: string; name: string; role: string | null }>;
+  target_agent_ids?: string[];
+  target_agent_names?: string[];
   playbook?: { version: number };
 };
 
@@ -91,4 +95,12 @@ export type FluffleInboundMessage = {
   fileName?: string | null;
   fileMimeType?: string | null;
   playbook?: { version: number };
+  /** IDs of agents the server targeted for this message */
+  targetAgentIds?: string[];
+  /** Names of targeted agents */
+  targetAgentNames?: string[];
+  /** Info about the recipient agent (role, etc.) — from agent-channel delivery */
+  recipientAgent?: { id?: string; name?: string; role: string | null };
+  /** All agent teammates in this group */
+  teammates?: Array<{ id?: string; name: string; role: string | null }>;
 };

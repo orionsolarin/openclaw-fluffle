@@ -28,6 +28,31 @@ const MAX_TIMESTAMP_AGE_SECONDS = 300;
 // Per-team playbook cache (module-level, persists across messages)
 const playbookCache = new Map<string, { version: number; content: string }>();
 
+// Global deduplication for processMessage — prevents double-processing from
+// both agent-channel and group-channel delivering the same message
+const processedMessageIds = new Set<string>();
+const MAX_PROCESSED_IDS = 1000;
+
+function markMessageProcessed(id: string): boolean {
+  if (!id) return false; // no id = can't dedup, allow through
+  if (processedMessageIds.has(id)) return true; // already processed
+  processedMessageIds.add(id);
+  // Trim oldest entries when too large
+  if (processedMessageIds.size > MAX_PROCESSED_IDS) {
+    const iter = processedMessageIds.values();
+    for (let i = 0; i < 200; i++) iter.next();
+    // Keep only the newest entries
+    const arr = Array.from(processedMessageIds);
+    processedMessageIds.clear();
+    for (const v of arr.slice(-MAX_PROCESSED_IDS + 200)) processedMessageIds.add(v);
+  }
+  return false; // first time seeing this message
+}
+
+// Per-team context cache (channel digest + project state)
+const contextCache = new Map<string, { fetchedAt: number; digest: string }>();
+const CONTEXT_CACHE_TTL_MS = 300_000; // 5min
+
 export type FluffleMonitorOptions = {
   account: ResolvedFluffleAccount;
   config: OpenClawConfig;
@@ -115,6 +140,12 @@ function parseWebhookPayload(payload: WebhookPayload): FluffleInboundMessage {
     fileName: payload.message.file_name ?? null,
     fileMimeType: payload.message.file_mime_type ?? null,
     playbook: payload.playbook,
+    targetAgentIds: payload.target_agent_ids,
+    targetAgentNames: payload.target_agent_names,
+    recipientAgent: payload.recipient_agent
+      ? { id: payload.recipient_agent.id, name: payload.recipient_agent.name, role: payload.recipient_agent.role }
+      : undefined,
+    teammates: payload.teammates,
   };
 }
 
@@ -128,10 +159,31 @@ async function processMessage(
   runtime: RuntimeEnv,
   statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void,
 ): Promise<void> {
+  // Deduplication — same message may arrive via both agent-channel and group-channel
+  if (markMessageProcessed(message.id)) {
+    runtime.log?.(`[fluffle] processMessage: dedup skip id=${message.id}`);
+    return;
+  }
+
   // Skip messages from our own agent
   if (message.senderType === "agent" && message.senderId === account.config.agentId) return;
 
-  runtime.log?.(`[fluffle] processMessage: from=${message.senderName} content="${message.content?.slice(0, 50)}" groupId=${message.groupId} fileId=${message.fileId ?? "none"} fileName=${message.fileName ?? "none"}`);
+  // Skip activity messages (e.g. "X shared a file", "X joined") — these are system echoes
+  if (message.messageType === "activity") {
+    runtime.log?.(`[fluffle] processMessage: skipping activity message: "${message.content?.slice(0, 50)}"`);
+    return;
+  }
+
+  // Target filtering: if the server specified target_agent_ids, only process if we're targeted
+  const myAgentId = account.config.agentId;
+  if (message.targetAgentIds && message.targetAgentIds.length > 0) {
+    if (!message.targetAgentIds.includes(myAgentId)) {
+      runtime.log?.(`[fluffle] processMessage: not targeted (targets=${message.targetAgentIds.join(',')}), skipping`);
+      return;
+    }
+  }
+
+  runtime.log?.(`[fluffle] processMessage: from=${message.senderName} content="${message.content?.slice(0, 50)}" groupId=${message.groupId} targeted=${message.targetAgentIds?.includes(myAgentId) ?? 'all'} fileId=${message.fileId ?? "none"} fileName=${message.fileName ?? "none"}`);
 
   const pairing = createScopedPairingAccess({
     core,
@@ -229,11 +281,69 @@ async function processMessage(
     storePath,
     sessionKey: route.sessionKey,
   });
-  // Prepend playbook if available
+  // Fetch team context (channel digest + project state) — cached 60s
+  let teamContextBlock = "";
+  if (message.teamId) {
+    const cached = contextCache.get(message.teamId);
+    if (cached && Date.now() - cached.fetchedAt < CONTEXT_CACHE_TTL_MS) {
+      teamContextBlock = cached.digest;
+    } else {
+      try {
+        const contextApi = new FluffleApi(account);
+        const ctx = await contextApi.getTeamContext(message.teamId);
+        if (ctx) {
+          const parts: string[] = [];
+          // Channel digest
+          if (ctx.channelDigest?.length) {
+            parts.push("[Team Context — Channel Digest]");
+            for (const ch of ctx.channelDigest) {
+              if (!ch.recentMessages?.length) continue;
+              parts.push(`#${ch.channelName} (${ch.channelType}):`);
+              for (const m of ch.recentMessages.slice(-3)) {
+                parts.push(`  ${m.senderName}: ${m.content.slice(0, 200)}`);
+              }
+            }
+            parts.push("[End Channel Digest]");
+          }
+          // Project state
+          if (ctx.projectState?.length) {
+            parts.push("[Team Context — Project State]");
+            for (const proj of ctx.projectState) {
+              parts.push(`Project: ${proj.projectName}`);
+              for (const col of proj.columns) {
+                if (!col.tasks?.length) continue;
+                parts.push(`  ${col.title}:`);
+                for (const t of col.tasks) {
+                  parts.push(`    - "${t.title}" → ${t.assignee || 'unassigned'} (${t.priority})`);
+                }
+              }
+            }
+            parts.push("[End Project State]");
+          }
+          // Playbook from context (may be newer than cached)
+          if (ctx.playbook?.version && ctx.playbook.content) {
+            const existing = playbookCache.get(message.teamId);
+            if (!existing || existing.version < ctx.playbook.version) {
+              playbookCache.set(message.teamId, ctx.playbook);
+              playbookContent = ctx.playbook.content;
+            }
+          }
+          teamContextBlock = parts.join("\n");
+          contextCache.set(message.teamId, { fetchedAt: Date.now(), digest: teamContextBlock });
+        }
+      } catch (err) {
+        runtime.log?.(`[fluffle] Failed to fetch team context: ${String(err)}`);
+      }
+    }
+  }
+
+  // Prepend playbook + context if available
   const cachedPlaybook = playbookCache.get(message.teamId);
-  const effectiveBody = playbookContent
-    ? `[Team Playbook - v${cachedPlaybook?.version ?? '?'}]\n${playbookContent}\n[End Playbook]\n\n${rawBody}`
-    : rawBody;
+  const contextPrefix = [
+    teamContextBlock,
+    playbookContent ? `[Team Playbook - v${cachedPlaybook?.version ?? '?'}]\n${playbookContent}\n[End Playbook]` : "",
+  ].filter(Boolean).join("\n\n");
+  const effectiveBody = contextPrefix ? `${contextPrefix}\n\n${rawBody}` : rawBody;
 
   const body = core.channel.reply.formatAgentEnvelope({
     channel: "Fluffle",
@@ -566,58 +676,118 @@ async function startPusherListener(
   // Subscribe to agent channel
   const agentChannel = pusher.subscribe(`private-agent-${account.config.agentId}`);
   agentChannel.bind("message:new", (data: any) => {
-    const payload = data as WebhookPayload;
-    if (payload.event !== "message.new" && !payload.message) return;
-    const message = parseWebhookPayload({
-      event: "message.new",
-      team_id: payload.team_id ?? "",
-      group_id: payload.group_id ?? "",
-      message: payload.message,
-      recipient_agent: payload.recipient_agent,
-      teammates: payload.teammates,
-      playbook: payload.playbook,
-    });
+    runtime.log?.(`[fluffle] Pusher agent message received: ${JSON.stringify(data).slice(0, 300)}`);
+
+    // Handle both WebhookPayload shape (new: has message object) and flat shape (legacy)
+    let message: FluffleInboundMessage;
+    if (data.message && typeof data.message === "object" && data.message.content !== undefined) {
+      // New WebhookPayload shape — use parseWebhookPayload
+      message = parseWebhookPayload({
+        event: "message.new",
+        team_id: data.team_id ?? "",
+        group_id: data.group_id ?? "",
+        message: data.message,
+        recipient_agent: data.recipient_agent,
+        teammates: data.teammates,
+        target_agent_ids: data.target_agent_ids,
+        target_agent_names: data.target_agent_names,
+        playbook: data.playbook,
+      });
+    } else if (data.content !== undefined) {
+      // Legacy flat shape — normalize manually
+      message = {
+        id: data.id ?? "",
+        groupId: data.group_id ?? "",
+        teamId: data.team_id ?? "",
+        senderId: data.sender_user_id ?? data.sender_agent_id ?? data.sender_id ?? "",
+        senderName: data.sender_name ?? "",
+        senderType: data.sender_agent_id ? "agent" : "user",
+        content: data.content ?? "",
+        messageType: data.message_type ?? "text",
+        createdAt: data.created_at ?? new Date().toISOString(),
+        replyTo: data.reply_to ?? null,
+        fileId: data.file_id ?? null,
+        fileName: data.file_name ?? null,
+        fileMimeType: data.file_mime_type ?? null,
+        targetAgentIds: data.target_agent_ids,
+        targetAgentNames: data.target_agent_names,
+        teammates: data.teammates,
+      };
+    } else {
+      runtime.log?.(`[fluffle] Pusher agent message: unrecognized shape, skipping`);
+      return;
+    }
+
     trackMessage(message.id, message.createdAt);
     statusSink?.({ lastInboundAt: Date.now() });
     processMessage(message, account, config, core, runtime, statusSink).catch((err) => {
-      runtime.error(`[fluffle] Failed to process Pusher message: ${String(err)}`);
+      runtime.error(`[fluffle] Failed to process Pusher agent message: ${String(err)}`);
     });
   });
 
-  // Fetch and subscribe to group channels
-  try {
-    const groups = await api.getGroups();
-    for (const group of groups) {
-      const channel = pusher.subscribe(`private-group-${group.id}`);
-      channel.bind("message:new", (data: any) => {
-        runtime.log?.(`[fluffle] Pusher group message received: ${JSON.stringify(data).slice(0, 300)}`);
-        if (data.sender_agent_id === account.config.agentId) return;
-        const message: FluffleInboundMessage = {
-          id: data.id ?? "",
-          groupId: group.id,
-          teamId: group.team_id ?? "",
-          senderId: data.sender_user_id ?? data.sender_agent_id ?? data.sender_id ?? data.sender?.id ?? "",
-          senderName: data.sender_name ?? data.sender?.name ?? "",
-          senderType: data.sender_agent_id ? "agent" : (data.sender_type ?? "user"),
-          content: data.content ?? "",
-          messageType: data.message_type ?? "text",
-          createdAt: data.created_at ?? new Date().toISOString(),
-          replyTo: data.reply_to ?? null,
-          fileId: data.file_id ?? null,
-          fileName: data.file_name ?? null,
-          fileMimeType: data.file_mime_type ?? null,
-        };
-        trackMessage(message.id, message.createdAt);
-        statusSink?.({ lastInboundAt: Date.now() });
-        processMessage(message, account, config, core, runtime, statusSink).catch((err) => {
-          runtime.error(`[fluffle] Failed to process Pusher group message: ${String(err)}`);
-        });
+  // ─── Dynamic group subscription ──────────────────────────────────────────
+  const subscribedGroups = new Set<string>();
+
+  function subscribeToGroup(groupId: string, teamId: string) {
+    if (subscribedGroups.has(groupId)) return;
+    subscribedGroups.add(groupId);
+    const channel = pusher.subscribe(`private-group-${groupId}`);
+    channel.bind("message:new", (data: any) => {
+      runtime.log?.(`[fluffle] Pusher group message received: ${JSON.stringify(data).slice(0, 300)}`);
+      if (data.sender_agent_id === account.config.agentId) return;
+      const message: FluffleInboundMessage = {
+        id: data.id ?? "",
+        groupId: groupId,
+        teamId: data.team_id ?? teamId ?? "",
+        senderId: data.sender_user_id ?? data.sender_agent_id ?? data.sender_id ?? data.sender?.id ?? "",
+        senderName: data.sender_name ?? data.sender?.name ?? "",
+        senderType: data.sender_agent_id ? "agent" : (data.sender_type ?? "user"),
+        content: data.content ?? "",
+        messageType: data.message_type ?? "text",
+        createdAt: data.created_at ?? new Date().toISOString(),
+        replyTo: data.reply_to ?? null,
+        fileId: data.file_id ?? null,
+        fileName: data.file_name ?? null,
+        fileMimeType: data.file_mime_type ?? null,
+        playbook: data.playbook,
+        targetAgentIds: data.target_agent_ids,
+        targetAgentNames: data.target_agent_names,
+        teammates: data.teammates,
+      };
+      trackMessage(message.id, message.createdAt);
+      statusSink?.({ lastInboundAt: Date.now() });
+      processMessage(message, account, config, core, runtime, statusSink).catch((err) => {
+        runtime.error(`[fluffle] Failed to process Pusher group message: ${String(err)}`);
       });
-    }
-    runtime.log?.(`[fluffle] Subscribed to ${groups.length} group channel(s) via Pusher`);
-  } catch (err) {
-    runtime.error?.(`[fluffle] Failed to fetch groups for Pusher: ${String(err)}`);
+    });
   }
+
+  async function refreshGroupSubscriptions() {
+    try {
+      const groups = await api.getGroups();
+      let newCount = 0;
+      for (const group of groups) {
+        if (!subscribedGroups.has(group.id)) {
+          subscribeToGroup(group.id, group.team_id);
+          newCount++;
+        }
+      }
+      if (newCount > 0) {
+        runtime.log?.(`[fluffle] Subscribed to ${newCount} new group channel(s) (total: ${subscribedGroups.size})`);
+      }
+    } catch (err) {
+      runtime.error?.(`[fluffle] Failed to refresh group subscriptions: ${String(err)}`);
+    }
+  }
+
+  // Initial subscription
+  await refreshGroupSubscriptions();
+  runtime.log?.(`[fluffle] Subscribed to ${subscribedGroups.size} group channel(s) via Pusher`);
+
+  // Periodic refresh for new groups (every 60s)
+  const groupRefreshInterval = setInterval(() => {
+    refreshGroupSubscriptions();
+  }, 60_000);
 
   // ─── Agent validation on persistent errors ─────────────────────────────
   let consecutiveHeartbeatErrors = 0;
@@ -671,6 +841,7 @@ async function startPusherListener(
     "abort",
     () => {
       clearInterval(heartbeatInterval);
+      clearInterval(groupRefreshInterval);
       pusher.disconnect();
       runtime.log?.(`[fluffle] Pusher disconnected`);
     },
