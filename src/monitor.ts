@@ -781,6 +781,63 @@ async function startPusherListener(
     };
     channel.bind("message:new", groupMessageHandler);
     channel.bind("message:created", groupMessageHandler);
+
+    // Handle streaming message finalization — agents that use streaming send
+    // initial message:new with empty content, then stream chunks, then fire
+    // message:stream:end with the final content. We must process the final content.
+    channel.bind("message:stream:end", (data: any) => {
+      runtime.log?.(`[fluffle] Pusher stream:end received: msgId=${data.messageId} content="${(data.content ?? "").slice(0, 100)}"`);
+      if (!data.content?.trim()) return; // still empty, skip
+
+      // We need sender info — fetch it from the API
+      const fetchAndProcess = async () => {
+        try {
+          // Fetch the finalized message to get sender info
+          const res = await fetch(`${account.config.baseUrl.replace(/\/$/, "")}/api/groups/${groupId}/messages?limit=10`, {
+            headers: { Authorization: `Bearer ${account.config.apiKey}` },
+          });
+          if (!res.ok) {
+            runtime.error?.(`[fluffle] Failed to fetch messages for stream:end context: ${res.status}`);
+            return;
+          }
+          const resBody = await res.json() as any;
+          const messages: any[] = Array.isArray(resBody) ? resBody : (resBody.messages ?? []);
+          const msg = messages.find((m: any) => m.id === data.messageId);
+          if (!msg) {
+            runtime.log?.(`[fluffle] stream:end message ${data.messageId} not found in recent messages`);
+            return;
+          }
+          // Skip our own messages
+          if (msg.sender_agent_id === account.config.agentId) return;
+
+          const message: FluffleInboundMessage = {
+            id: `${msg.id}-stream-end`, // Unique ID to avoid dedup with the empty initial message
+            groupId: groupId,
+            teamId: msg.team_id ?? teamId ?? "",
+            senderId: msg.sender_user_id ?? msg.sender_agent_id ?? "",
+            senderName: msg.sender_name ?? msg.sender?.name ?? "",
+            senderType: msg.sender_agent_id ? "agent" : (msg.sender_type ?? "user"),
+            content: data.content, // Use the finalized content from the event
+            messageType: "text", // Treat finalized streaming as regular text
+            createdAt: msg.created_at ?? new Date().toISOString(),
+            replyTo: msg.reply_to ?? null,
+            fileId: msg.file_id ?? null,
+            fileName: msg.file_name ?? null,
+            fileMimeType: msg.file_mime_type ?? null,
+            playbook: msg.playbook,
+            targetAgentIds: msg.target_agent_ids,
+            targetAgentNames: msg.target_agent_names,
+            teammates: msg.teammates,
+          };
+          trackMessage(message.id, message.createdAt);
+          statusSink?.({ lastInboundAt: Date.now() });
+          await processMessage(message, account, config, core, runtime, statusSink);
+        } catch (err) {
+          runtime.error?.(`[fluffle] Failed to process stream:end message: ${String(err)}`);
+        }
+      };
+      fetchAndProcess();
+    });
   }
 
   async function refreshGroupSubscriptions() {
