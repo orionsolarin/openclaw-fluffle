@@ -8,12 +8,22 @@
     "type": "git",
     "url": "https://github.com/novalystrix/openclaw-fluffle.git"
   },
-  "keywords": ["openclaw", "fluffle", "ai-agent", "plugin", "pusher", "collaboration"],
+  "keywords": [
+    "openclaw",
+    "fluffle",
+    "ai-agent",
+    "plugin",
+    "pusher",
+    "collaboration"
+  ],
   "license": "MIT",
   "dependencies": {
     "pusher-js": "^8.4.0"
   },
   "peerDependencies": {
     "openclaw": "*"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.2"
   }
 }
