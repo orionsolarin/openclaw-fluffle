@@ -64,7 +64,7 @@ export const fluffleDock: ChannelDock = {
   outbound: { textChunkLimit: 4096 },
   config: {
     resolveAllowFrom: ({ cfg, accountId }) =>
-      (resolveFluffleAccountSync({ cfg, accountId }).config.allowFrom ?? []).map(String),
+      (resolveFluffleAccountSync({ cfg, accountId: accountId ?? undefined }).config.allowFrom ?? []).map(String),
     formatAllowFrom: ({ allowFrom }) =>
       formatAllowFromLowercase({ allowFrom, stripPrefixRe: /^fluffle:/i }),
   },
@@ -90,10 +90,10 @@ export const flufflePlugin: ChannelPlugin<ResolvedFluffleAccount> = {
     blockStreaming: false,
   },
   reload: { configPrefixes: ["channels.fluffle", "plugins.entries.fluffle"] },
-  configSchema: buildChannelConfigSchema(FluffleConfigSchema),
+  configSchema: buildChannelConfigSchema(FluffleConfigSchema as any),
   config: {
     listAccountIds: (cfg) => listFluffleAccountIds(cfg),
-    resolveAccount: (cfg, accountId) => resolveFluffleAccountSync({ cfg, accountId }),
+    resolveAccount: (cfg, accountId) => resolveFluffleAccountSync({ cfg, accountId: accountId ?? undefined }),
     defaultAccountId: (cfg) => resolveDefaultFluffleAccountId(cfg),
     setAccountEnabled: ({ cfg, accountId, enabled }) =>
       setAccountEnabledInConfigSection({
@@ -125,7 +125,7 @@ export const flufflePlugin: ChannelPlugin<ResolvedFluffleAccount> = {
       configured: undefined,
     }),
     resolveAllowFrom: ({ cfg, accountId }) =>
-      (resolveFluffleAccountSync({ cfg, accountId }).config.allowFrom ?? []).map(String),
+      (resolveFluffleAccountSync({ cfg, accountId: accountId ?? undefined }).config.allowFrom ?? []).map(String),
     formatAllowFrom: ({ allowFrom }) =>
       formatAllowFromLowercase({ allowFrom, stripPrefixRe: /^fluffle:/i }),
   },
@@ -162,15 +162,15 @@ export const flufflePlugin: ChannelPlugin<ResolvedFluffleAccount> = {
     },
   },
   gateway: {
-    startAccount: async ({ cfg, account, runtime, abortSignal }) => {
+    startAccount: async ({ cfg, account, runtime, abortSignal }: any) => {
       runtime.log?.(`[fluffle] startAccount() called, account=${account.accountId}, enabled=${account.enabled}`);
       const { monitorFluffle } = await import("./monitor.js");
       runtime.log?.(`[fluffle] monitor imported, starting...`);
       await monitorFluffle({ account, config: cfg, runtime, abortSignal });
     },
-    send: async ({ target, text }) => {
-      const result = await sendMessageFluffle(target, text);
+    send: async ({ target, text, mediaUrl, mediaType }: any) => {
+      const result = await sendMessageFluffle(target, text, mediaUrl, mediaType);
       return { ok: result.ok, error: result.error };
     },
-  },
+  } as any,
 };

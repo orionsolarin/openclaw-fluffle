@@ -98,6 +98,21 @@ function verifyWebhookSignature(
   }
 }
 
+// ─── Cycle message detection ────────────────────────────────────────────────
+
+export function detectCycleMessage(content: string): { type: "plan" | "tldr" | null; cycleNumber?: number } {
+  if (!content) return { type: null };
+  const cycleMatch = content.match(/\[Cycle #(\d+)/);
+  const cycleNumber = cycleMatch ? parseInt(cycleMatch[1], 10) : undefined;
+  if (content.startsWith("[Cycle #") && content.includes("Plan]")) {
+    return { type: "plan", cycleNumber };
+  }
+  if (content.includes("[Cycle #") && content.includes("TLDR]")) {
+    return { type: "tldr", cycleNumber };
+  }
+  return { type: null };
+}
+
 // ─── Allow-from helpers ─────────────────────────────────────────────────────
 
 function isSenderAllowed(senderId: string, allowFrom: Array<string | number>): boolean {
@@ -180,6 +195,25 @@ async function processMessage(
   if (message.messageType === "activity") {
     runtime.log?.(`[fluffle] processMessage: skipping activity message: "${message.content?.slice(0, 50)}"`);
     return;
+  }
+
+  // ── Cycle message detection ────────────────────────────────────────────────
+  // Intercept cycle-marker messages from other agents before normal processing.
+  if (message.senderType === "agent" && message.content?.trim()) {
+    const cycleEvent = detectCycleMessage(message.content.trim());
+    if (cycleEvent.type === "plan") {
+      runtime.log?.(`[fluffle] Cycle plan detected (cycle #${cycleEvent.cycleNumber}) from ${message.senderName} — triggering Agent 2`);
+      (core.channel as any).injectSystemEvent?.(message.content.trim());
+      return;
+    }
+    if (cycleEvent.type === "tldr") {
+      runtime.log?.(`[fluffle] Cycle TLDR detected (cycle #${cycleEvent.cycleNumber}) from ${message.senderName} — closing cycle`);
+      const cycleApi = new FluffleApi(account);
+      cycleApi.closeCycle(message.teamId, message.content.trim(), cycleEvent.cycleNumber).catch((err) => {
+        runtime.error?.(`[fluffle] Failed to close cycle via API: ${String(err)}`);
+      });
+      return;
+    }
   }
 
   // Note: target_agent_ids is informational context — the server controls delivery
@@ -571,10 +605,10 @@ function startWebhookListener(
   runtime: RuntimeEnv,
   statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void,
 ): void {
-  core.http.registerHttpRoute({
+  (core as any).http.registerHttpRoute({
     method: "POST",
     path: "/channels/fluffle/webhook",
-    handler: async (req) => {
+    handler: async (req: any) => {
       const signature = req.headers["x-fluffle-signature"] as string;
       const timestamp = req.headers["x-fluffle-timestamp"] as string;
       const rawBody = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
@@ -668,14 +702,14 @@ async function startPusherListener(
           teamId: msg.team_id ?? "",
           senderId: msg.sender_user_id ?? msg.sender_agent_id ?? "",
           senderName: msg.sender_name ?? "",
-          senderType: msg.sender_agent_id ? "agent" : (msg.sender_type ?? "user"),
+          senderType: (msg.sender_agent_id ? "agent" : (msg.sender_type ?? "user")) as "agent" | "user",
           content: msg.content ?? "",
           messageType: msg.message_type ?? "text",
           createdAt: msg.created_at ?? new Date().toISOString(),
-          replyTo: msg.reply_to ?? null,
-          fileId: msg.file_id ?? null,
-          fileName: msg.file_name ?? null,
-          fileMimeType: msg.file_mime_type ?? null,
+          replyTo: (msg as any).reply_to ?? null,
+          fileId: (msg as any).file_id ?? null,
+          fileName: (msg as any).file_name ?? null,
+          fileMimeType: (msg as any).file_mime_type ?? null,
         };
         trackMessage(msg.id, msg.created_at);
         statusSink?.({ lastInboundAt: Date.now() });
@@ -692,9 +726,10 @@ async function startPusherListener(
 
   // Dynamic import pusher-js
   const PusherModule = await import("pusher-js");
-  const Pusher = PusherModule.default ?? PusherModule;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const PusherClass = (PusherModule.default ?? PusherModule) as any;
 
-  const pusher = new Pusher(pusherConfig.key, {
+  const pusher = new PusherClass(pusherConfig.key, {
     cluster: pusherConfig.cluster,
     authorizer: (channel: { name: string }) => ({
       authorize: (socketId: string, callback: (error: Error | null, data: { auth: string } | null) => void) => {
@@ -834,7 +869,7 @@ async function startPusherListener(
         teamId: cached.teamId || teamId,
         senderId: cached.senderId,
         senderName: cached.senderName,
-        senderType: cached.senderType,
+        senderType: cached.senderType as "agent" | "user",
         content: content,
         messageType: "text",
         createdAt: cached.createdAt,
@@ -895,7 +930,7 @@ async function startPusherListener(
         // Notify user via other channels
         try {
           const msg = `⚠️ My Fluffle agent has been removed or my API key was revoked (reason: ${result.reason}). The Fluffle plugin is now disabled.`;
-          core.channel.injectSystemEvent?.(msg);
+          (core.channel as any).injectSystemEvent?.(msg);
         } catch (_) { /* best effort */ }
         return false;
       }

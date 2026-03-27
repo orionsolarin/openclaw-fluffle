@@ -152,7 +152,7 @@ export class FluffleApi {
 
   async uploadFile(groupId: string, buffer: Buffer, filename: string, mimeType: string): Promise<{ fileId: string }> {
     const form = new FormData();
-    form.append("file", new Blob([buffer], { type: mimeType }), filename);
+    form.append("file", new Blob([buffer as unknown as ArrayBuffer], { type: mimeType }), filename);
     const url = `${this.baseUrl}/api/groups/${groupId}/files`;
     const res = await fetch(url, {
       method: "POST",
@@ -165,6 +165,47 @@ export class FluffleApi {
     }
     const data = await res.json() as { file_id?: string; fileId?: string };
     return { fileId: data.file_id ?? data.fileId ?? "" };
+  }
+
+  async triggerCycle(teamId: string): Promise<{
+    cycleNumber: number;
+    concernTitle: string;
+    iteration: number;
+    iterationsAllowed: number;
+  }> {
+    return this.request(`/api/teams/${teamId}/cycles/trigger`, { method: "POST" });
+  }
+
+  async getCycles(teamId: string, limit = 10): Promise<Array<{
+    id?: string;
+    number?: number;
+    cycleNumber?: number;
+    tldr?: string;
+    summary?: string;
+    carryForward?: string[];
+    carry_forward?: string[];
+    status?: string;
+    createdAt?: string;
+    created_at?: string;
+  }>> {
+    const data = await this.request<{ cycles: any[] }>(`/api/teams/${teamId}/cycles?limit=${limit}`);
+    return data.cycles ?? [];
+  }
+
+  async getCycleState(teamId: string): Promise<{
+    currentCycle?: number;
+    status?: string;
+    concern?: { title: string; iteration: number; iterationsAllowed: number };
+    openedAt?: string;
+  }> {
+    return this.request(`/api/teams/${teamId}/cycles/state`);
+  }
+
+  async closeCycle(teamId: string, tldr: string, cycleNumber?: number): Promise<void> {
+    await this.request(`/api/teams/${teamId}/cycles/close`, {
+      method: "POST",
+      body: JSON.stringify({ tldr, ...(cycleNumber !== undefined ? { cycle_number: cycleNumber } : {}) }),
+    });
   }
 
   async pusherAuth(socketId: string, channelName: string): Promise<{ auth: string }> {
