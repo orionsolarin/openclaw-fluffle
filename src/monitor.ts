@@ -385,16 +385,13 @@ async function processMessage(
   const teamName = groupInfo?.teamName ?? message.teamId;
   const groupName = groupInfo?.title ?? message.groupId;
 
-  // Build agent identity context (role, teammates)
+  // Build agent identity context (teammates only — no roles in v2)
   const agentContextParts: string[] = [];
-  if (message.recipientAgent?.role) {
-    agentContextParts.push(`[Your Role] ${message.recipientAgent.role}`);
-  }
   if (message.teammates?.length) {
     const teammateList = message.teammates
-      .map(t => `  - ${t.name}${t.role ? ` (${t.role})` : ''}`)
+      .map(t => `  - ${t.name}`)
       .join('\n');
-    agentContextParts.push(`[Team Members in this group]\n${teammateList}`);
+    agentContextParts.push(`[Team Members]\n${teammateList}`);
   }
   const agentContext = agentContextParts.length ? agentContextParts.join('\n') + '\n\n' : '';
 
