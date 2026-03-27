@@ -32,10 +32,10 @@ export class FluffleApi {
     await this.request(`/api/groups/${groupId}/typing`, { method: "POST" }).catch(() => {});
   }
 
-  async sendMessage(groupId: string, content: string): Promise<{ id: string }> {
+  async sendMessage(groupId: string, content: string, fileId?: string): Promise<{ id: string }> {
     return this.request<{ id: string }>(`/api/groups/${groupId}/messages`, {
       method: "POST",
-      body: JSON.stringify({ content, message_type: "text" }),
+      body: JSON.stringify({ content, message_type: "text", ...(fileId ? { file_id: fileId } : {}) }),
     });
   }
 
@@ -132,7 +132,6 @@ export class FluffleApi {
 
   async getTeamContext(teamId: string): Promise<{
     channelDigest?: Array<{ channelName: string; channelType: string; recentMessages: Array<{ senderName: string; content: string; createdAt: string }> }>;
-    projectState?: Array<{ projectName: string; columns: Array<{ title: string; tasks: Array<{ title: string; assignee: string; priority: string }> }> }>;
     playbook?: { version: number; content: string };
   } | null> {
     try {
@@ -149,6 +148,23 @@ export class FluffleApi {
     if (!res.ok) return null;
     const data = await res.json() as { playbook?: { version: number; content: string } | null };
     return data.playbook ? { version: data.playbook.version, content: data.playbook.content } : null;
+  }
+
+  async uploadFile(groupId: string, buffer: Buffer, filename: string, mimeType: string): Promise<{ fileId: string }> {
+    const form = new FormData();
+    form.append("file", new Blob([buffer], { type: mimeType }), filename);
+    const url = `${this.baseUrl}/api/groups/${groupId}/files`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.apiKey}` },
+      body: form,
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`Fluffle API ${res.status}: upload file — ${body}`);
+    }
+    const data = await res.json() as { file_id?: string; fileId?: string };
+    return { fileId: data.file_id ?? data.fileId ?? "" };
   }
 
   async pusherAuth(socketId: string, channelName: string): Promise<{ auth: string }> {

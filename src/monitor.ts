@@ -49,6 +49,11 @@ function markMessageProcessed(id: string): boolean {
   return false; // first time seeing this message
 }
 
+// Cache sender info from streaming message:new events (empty content)
+// so we can match them when stream:end arrives with the final content
+const streamingSenderCache = new Map<string, { senderId: string; senderName: string; senderType: string; teamId: string; groupId: string; createdAt: string }>();
+const MAX_STREAMING_CACHE = 200;
+
 // Per-team context cache (channel digest + project state)
 const contextCache = new Map<string, { fetchedAt: number; digest: string }>();
 const CONTEXT_CACHE_TTL_MS = 300_000; // 5min
@@ -189,7 +194,28 @@ async function processMessage(
     accountId: account.accountId,
   });
 
-  if (!message.content?.trim()) { runtime.log?.(`[fluffle] processMessage: empty content, skipping`); return; }
+  if (!message.content?.trim()) {
+    // Cache sender info for streaming messages — stream:end will use this
+    if (message.messageType === "streaming" && message.id) {
+      streamingSenderCache.set(message.id, {
+        senderId: message.senderId,
+        senderName: message.senderName,
+        senderType: message.senderType,
+        teamId: message.teamId,
+        groupId: message.groupId,
+        createdAt: message.createdAt,
+      });
+      // Trim cache
+      if (streamingSenderCache.size > MAX_STREAMING_CACHE) {
+        const keys = Array.from(streamingSenderCache.keys());
+        for (let i = 0; i < 50; i++) streamingSenderCache.delete(keys[i]);
+      }
+      runtime.log?.(`[fluffle] processMessage: cached streaming sender for ${message.id} (${message.senderName})`);
+    } else {
+      runtime.log?.(`[fluffle] processMessage: empty content, skipping`);
+    }
+    return;
+  }
 
   // Fluffle groups are always group chats; DMs are 1:1 groups
   // We treat all messages as group context since Fluffle is group-based
@@ -294,29 +320,14 @@ async function processMessage(
           // Channel digest
           if (ctx.channelDigest?.length) {
             parts.push("[Team Context — Channel Digest]");
-            for (const ch of ctx.channelDigest) {
+            for (const ch of ctx.channelDigest.slice(0, 2)) {
               if (!ch.recentMessages?.length) continue;
               parts.push(`#${ch.channelName} (${ch.channelType}):`);
               for (const m of ch.recentMessages.slice(-3)) {
-                parts.push(`  ${m.senderName}: ${m.content.slice(0, 200)}`);
+                parts.push(`  ${m.senderName}: ${m.content.slice(0, 150)}`);
               }
             }
             parts.push("[End Channel Digest]");
-          }
-          // Project state
-          if (ctx.projectState?.length) {
-            parts.push("[Team Context — Project State]");
-            for (const proj of ctx.projectState) {
-              parts.push(`Project: ${proj.projectName}`);
-              for (const col of proj.columns) {
-                if (!col.tasks?.length) continue;
-                parts.push(`  ${col.title}:`);
-                for (const t of col.tasks) {
-                  parts.push(`    - "${t.title}" → ${t.assignee || 'unassigned'} (${t.priority})`);
-                }
-              }
-            }
-            parts.push("[End Project State]");
           }
           // Playbook from context (may be newer than cached)
           if (ctx.playbook?.version && ctx.playbook.content) {
@@ -326,7 +337,7 @@ async function processMessage(
               playbookContent = ctx.playbook.content;
             }
           }
-          teamContextBlock = parts.join("\n");
+          teamContextBlock = parts.join("\n").slice(0, 500);
           contextCache.set(message.teamId, { fetchedAt: Date.now(), digest: teamContextBlock });
         }
       } catch (err) {
@@ -382,6 +393,21 @@ async function processMessage(
     runtime.log?.(`[fluffle] File attachment detected: fileId=${message.fileId} fileName=${message.fileName} mediaUrl=${fileMediaUrl}`);
   }
 
+  let resolvedMediaUrl = fileMediaUrl;
+  let resolvedMediaType = fileMediaType;
+  if (message.fileId && fileMediaUrl) {
+    try {
+      const resp = await fetch(fileMediaUrl, { headers: { Authorization: `Bearer ${account.config.apiKey}` } });
+      if (resp.ok) {
+        const ct = resp.headers.get("content-type") || fileMediaType || "application/octet-stream";
+        const buf = await resp.arrayBuffer();
+        const b64 = Buffer.from(buf).toString("base64");
+        resolvedMediaUrl = `data:${ct};base64,${b64}`;
+        resolvedMediaType = ct;
+      }
+    } catch {}
+  }
+
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: body,
     BodyForAgent: rawBody,
@@ -401,8 +427,8 @@ async function processMessage(
     MessageSid: message.id,
     OriginatingChannel: "fluffle",
     OriginatingTo: `fluffle:${message.groupId}`,
-    ...(fileMediaUrl ? { MediaUrl: fileMediaUrl, NumMedia: "1" } : {}),
-    ...(fileMediaType ? { MediaType: fileMediaType } : {}),
+    ...(resolvedMediaUrl ? { MediaUrl: resolvedMediaUrl, NumMedia: "1" } : {}),
+    ...(resolvedMediaType ? { MediaType: resolvedMediaType } : {}),
   });
 
   // Send typing indicator — we got the message and are working on a reply
@@ -783,60 +809,45 @@ async function startPusherListener(
     channel.bind("message:created", groupMessageHandler);
 
     // Handle streaming message finalization — agents that use streaming send
-    // initial message:new with empty content, then stream chunks, then fire
-    // message:stream:end with the final content. We must process the final content.
+    // initial message:new with empty content (cached in streamingSenderCache),
+    // then stream chunks, then fire message:stream:end with the final content.
     channel.bind("message:stream:end", (data: any) => {
-      runtime.log?.(`[fluffle] Pusher stream:end received: msgId=${data.messageId} content="${(data.content ?? "").slice(0, 100)}"`);
-      if (!data.content?.trim()) return; // still empty, skip
+      const msgId = data.messageId;
+      const content = data.content ?? "";
+      runtime.log?.(`[fluffle] Pusher stream:end received: msgId=${msgId} content="${content.slice(0, 100)}"`);
+      if (!content.trim()) return;
 
-      // We need sender info — fetch it from the API
-      const fetchAndProcess = async () => {
-        try {
-          // Fetch the finalized message to get sender info
-          const res = await fetch(`${account.config.baseUrl.replace(/\/$/, "")}/api/groups/${groupId}/messages?limit=10`, {
-            headers: { Authorization: `Bearer ${account.config.apiKey}` },
-          });
-          if (!res.ok) {
-            runtime.error?.(`[fluffle] Failed to fetch messages for stream:end context: ${res.status}`);
-            return;
-          }
-          const resBody = await res.json() as any;
-          const messages: any[] = Array.isArray(resBody) ? resBody : (resBody.messages ?? []);
-          const msg = messages.find((m: any) => m.id === data.messageId);
-          if (!msg) {
-            runtime.log?.(`[fluffle] stream:end message ${data.messageId} not found in recent messages`);
-            return;
-          }
-          // Skip our own messages
-          if (msg.sender_agent_id === account.config.agentId) return;
+      // Look up sender info from the cached initial streaming message
+      const cached = streamingSenderCache.get(msgId);
+      if (!cached) {
+        runtime.log?.(`[fluffle] stream:end: no cached sender for ${msgId}, skipping`);
+        return;
+      }
+      streamingSenderCache.delete(msgId);
 
-          const message: FluffleInboundMessage = {
-            id: `${msg.id}-stream-end`, // Unique ID to avoid dedup with the empty initial message
-            groupId: groupId,
-            teamId: msg.team_id ?? teamId ?? "",
-            senderId: msg.sender_user_id ?? msg.sender_agent_id ?? "",
-            senderName: msg.sender_name ?? msg.sender?.name ?? "",
-            senderType: msg.sender_agent_id ? "agent" : (msg.sender_type ?? "user"),
-            content: data.content, // Use the finalized content from the event
-            messageType: "text", // Treat finalized streaming as regular text
-            createdAt: msg.created_at ?? new Date().toISOString(),
-            replyTo: msg.reply_to ?? null,
-            fileId: msg.file_id ?? null,
-            fileName: msg.file_name ?? null,
-            fileMimeType: msg.file_mime_type ?? null,
-            playbook: msg.playbook,
-            targetAgentIds: msg.target_agent_ids,
-            targetAgentNames: msg.target_agent_names,
-            teammates: msg.teammates,
-          };
-          trackMessage(message.id, message.createdAt);
-          statusSink?.({ lastInboundAt: Date.now() });
-          await processMessage(message, account, config, core, runtime, statusSink);
-        } catch (err) {
-          runtime.error?.(`[fluffle] Failed to process stream:end message: ${String(err)}`);
-        }
+      // Skip our own messages
+      if (cached.senderId === account.config.agentId) return;
+
+      const message: FluffleInboundMessage = {
+        id: `${msgId}-stream-end`,
+        groupId: groupId,
+        teamId: cached.teamId || teamId,
+        senderId: cached.senderId,
+        senderName: cached.senderName,
+        senderType: cached.senderType,
+        content: content,
+        messageType: "text",
+        createdAt: cached.createdAt,
+        replyTo: null,
+        fileId: null,
+        fileName: null,
+        fileMimeType: null,
       };
-      fetchAndProcess();
+      trackMessage(message.id, message.createdAt);
+      statusSink?.({ lastInboundAt: Date.now() });
+      processMessage(message, account, config, core, runtime, statusSink).catch((err) => {
+        runtime.error?.(`[fluffle] Failed to process stream:end message: ${String(err)}`);
+      });
     });
   }
 
