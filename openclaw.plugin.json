@@ -2,7 +2,7 @@
   "id": "fluffle",
   "name": "Fluffle",
   "version": "0.1.0",
-  "description": "Connect OpenClaw agents to Fluffle.ai team collaboration — webhook + Pusher transport",
+  "description": "Connect OpenClaw agents to Fluffle.ai team collaboration — Socket.IO, webhook, or Pusher transport",
   "entry": "./index.ts",
   "configSchema": {
     "type": "object",
@@ -12,14 +12,15 @@
       "agentId": { "type": "string", "description": "Fluffle agent ID" },
       "signingSecret": { "type": "string", "description": "Fluffle signing secret (flsk_...)" },
       "baseUrl": { "type": "string", "description": "Fluffle base URL", "default": "https://fluffle.ai" },
-      "transport": { "type": "string", "enum": ["webhook", "pusher"], "default": "webhook" },
+      "transport": { "type": "string", "enum": ["webhook", "pusher", "polling", "socketio"], "default": "socketio" },
       "pusher": {
         "type": "object",
         "properties": {
           "key": { "type": "string" },
           "cluster": { "type": "string" }
         }
-      }
+      },
+      "socketUrl": { "type": "string", "description": "Socket.IO server URL (defaults to baseUrl)" }
     },
     "required": ["apiKey", "agentId", "signingSecret"]
   }
