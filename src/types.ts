@@ -5,8 +5,9 @@ export type FluffleConfig = {
   agentId: string;
   signingSecret: string;
   baseUrl: string;
-  transport?: "webhook" | "pusher";
+  transport?: "webhook" | "pusher" | "polling" | "socketio";
   pusher?: { key: string; cluster: string };
+  socketUrl?: string;
   dmPolicy?: "pairing" | "allowlist" | "open" | "disabled";
   allowFrom?: Array<string | number>;
   groupPolicy?: "open" | "allowlist" | "disabled";
@@ -24,8 +25,9 @@ export type FluffleAccountConfig = {
   agentId?: string;
   signingSecret?: string;
   baseUrl?: string;
-  transport?: "webhook" | "pusher";
+  transport?: "webhook" | "pusher" | "polling" | "socketio";
   pusher?: { key: string; cluster: string };
+  socketUrl?: string;
   dmPolicy?: "pairing" | "allowlist" | "open" | "disabled";
   allowFrom?: Array<string | number>;
   groupPolicy?: "open" | "allowlist" | "disabled";

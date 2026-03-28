@@ -9,7 +9,7 @@ export const FluffleConfigSchema = {
     agentId: { type: "string" },
     signingSecret: { type: "string" },
     baseUrl: { type: "string" },
-    transport: { type: "string", enum: ["webhook", "pusher"] },
+    transport: { type: "string", enum: ["webhook", "pusher", "polling", "socketio"] },
     pusher: {
       type: "object",
       properties: {
@@ -17,6 +17,7 @@ export const FluffleConfigSchema = {
         cluster: { type: "string" },
       },
     },
+    socketUrl: { type: "string" },
     dmPolicy: { type: "string", enum: ["pairing", "allowlist", "open", "disabled"] },
     allowFrom: { type: "array", items: { oneOf: [{ type: "string" }, { type: "number" }] } },
     groupPolicy: { type: "string", enum: ["open", "allowlist", "disabled"] },
