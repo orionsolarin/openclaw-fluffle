@@ -4,15 +4,14 @@ import type {
   OutboundReplyPayload,
   RuntimeEnv,
 } from "openclaw/plugin-sdk";
-import {
-  createScopedPairingAccess,
-  createReplyPrefixOptions,
-  resolveOutboundMediaUrls,
-  resolveOpenProviderRuntimeGroupPolicy,
-  resolveDefaultGroupPolicy,
-  resolveSenderCommandAuthorization,
-  sendMediaWithLeadingCaption,
-} from "openclaw/plugin-sdk";
+// These SDK functions may not exist in all gateway versions — import with fallbacks
+import * as _pluginSdk from "openclaw/plugin-sdk";
+const createReplyPrefixOptions = (_pluginSdk as any).createReplyPrefixOptions as
+  ((opts: any) => Record<string, unknown>) | undefined;
+const resolveOutboundMediaUrls = (_pluginSdk as any).resolveOutboundMediaUrls as
+  ((payload: any) => string[]) | undefined;
+const sendMediaWithLeadingCaption = (_pluginSdk as any).sendMediaWithLeadingCaption as
+  ((opts: any) => Promise<boolean>) | undefined;
 import { getFluffleRuntime } from "./runtime.js";
 import { FluffleApi } from "./api.js";
 import { sendMessageFluffle, initFluffleSendApi } from "./send.js";
@@ -293,17 +292,31 @@ async function processMessage(
 
   const peer = { kind: "group" as const, id: message.groupId };
 
-  const route = core.channel.routing.resolveAgentRoute({
-    cfg: config,
-    channel: "fluffle",
-    accountId: account.accountId,
-    peer,
-  });
+  let route: ReturnType<typeof core.channel.routing.resolveAgentRoute>;
+  try {
+    route = core.channel.routing.resolveAgentRoute({
+      cfg: config,
+      channel: "fluffle",
+      accountId: account.accountId,
+      peer,
+    });
+    runtime.log?.(`[fluffle] processMessage: route resolved — agentId=${route.agentId} sessionKey=${route.sessionKey} accountId=${route.accountId}`);
+  } catch (err) {
+    runtime.error?.(`[fluffle] processMessage: resolveAgentRoute FAILED: ${String(err)}`);
+    return;
+  }
 
   const fromLabel = `group:${message.groupId}`;
-  const storePath = core.channel.session.resolveStorePath(config.session?.store, {
-    agentId: route.agentId,
-  });
+  let storePath: string;
+  try {
+    storePath = core.channel.session.resolveStorePath(config.session?.store, {
+      agentId: route.agentId,
+    });
+    runtime.log?.(`[fluffle] processMessage: storePath=${storePath}`);
+  } catch (err) {
+    runtime.error?.(`[fluffle] processMessage: resolveStorePath FAILED: ${String(err)}`);
+    return;
+  }
   const envelopeOptions = core.channel.reply.resolveEnvelopeFormatOptions(config);
   const previousTimestamp = core.channel.session.readSessionUpdatedAt({
     storePath,
@@ -375,7 +388,9 @@ async function processMessage(
   ].filter(Boolean).join("\n\n");
   const effectiveBody = contextPrefix ? `${contextPrefix}\n\n${rawBody}` : rawBody;
 
-  const body = core.channel.reply.formatAgentEnvelope({
+  let body: string;
+  try {
+  body = core.channel.reply.formatAgentEnvelope({
     channel: "Fluffle",
     from: message.senderName || `${message.senderType}:${message.senderId}`,
     timestamp: new Date(message.createdAt).getTime(),
@@ -383,6 +398,11 @@ async function processMessage(
     envelope: envelopeOptions,
     body: effectiveBody,
   });
+  runtime.log?.(`[fluffle] processMessage: envelope formatted, body length=${body.length}`);
+  } catch (envelopeErr) {
+    runtime.error?.(`[fluffle] processMessage: formatAgentEnvelope FAILED: ${String(envelopeErr)}`);
+    return;
+  }
 
   // Resolve file attachment media URL if present
   const fileMediaUrl = message.fileId
@@ -409,6 +429,14 @@ async function processMessage(
     } catch {}
   }
 
+  // Build participants list from teammates
+  const participantNames: string[] = [];
+  if (message.teammates?.length) {
+    for (const t of message.teammates) {
+      if (t.name) participantNames.push(t.name);
+    }
+  }
+
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: body,
     BodyForAgent: rawBody,
@@ -420,6 +448,9 @@ async function processMessage(
     AccountId: route.accountId,
     ChatType: "group",
     ConversationLabel: fromLabel,
+    GroupSubject: groupName !== message.groupId ? groupName : undefined,
+    GroupChannel: groupName !== message.groupId ? groupName : undefined,
+    ...(participantNames.length ? { GroupParticipants: participantNames } : {}),
     SenderName: message.senderName || undefined,
     SenderId: message.senderId,
     CommandAuthorized: commandAuthorized,
@@ -432,10 +463,13 @@ async function processMessage(
     ...(resolvedMediaType ? { MediaType: resolvedMediaType } : {}),
   });
 
+  runtime.log?.(`[fluffle] processMessage: ctxPayload created, SessionKey=${ctxPayload.SessionKey}`);
+
   // Send typing indicator — we got the message and are working on a reply
   const typingApi = new FluffleApi(account);
   typingApi.sendTyping(message.groupId).catch(() => {});
 
+  runtime.log?.(`[fluffle] processMessage: about to recordInboundSession`);
   await core.channel.session.recordInboundSession({
     storePath,
     sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
@@ -445,12 +479,25 @@ async function processMessage(
     },
   });
 
-  const { onModelSelected, ...prefixOptions } = createReplyPrefixOptions({
-    cfg: config,
-    agentId: route.agentId,
-    channel: "fluffle",
-    accountId: account.accountId,
-  });
+  runtime.log?.(`[fluffle] processMessage: recordInboundSession done, creating prefixOptions`);
+  let prefixOptions: Record<string, unknown> = {};
+  let onModelSelected: unknown;
+  try {
+    if (typeof createReplyPrefixOptions === 'function') {
+      const result = createReplyPrefixOptions({
+        cfg: config,
+        agentId: route.agentId,
+        channel: "fluffle",
+        accountId: account.accountId,
+      });
+      ({ onModelSelected, ...prefixOptions } = result);
+      runtime.log?.(`[fluffle] processMessage: prefixOptions created OK`);
+    } else {
+      runtime.log?.(`[fluffle] processMessage: createReplyPrefixOptions not available in SDK, using defaults`);
+    }
+  } catch (prefixErr) {
+    runtime.log?.(`[fluffle] processMessage: createReplyPrefixOptions failed (${String(prefixErr)}), using defaults`);
+  }
 
   // ── Typing heartbeat while LLM is processing ──────────────────────────────
   const streamApi = new FluffleApi(account);
@@ -463,6 +510,7 @@ async function processMessage(
   streamApi.sendTyping(message.groupId).catch(() => {});
 
   runtime.log?.(`[fluffle] About to dispatch LLM reply for groupId=${message.groupId} sessionKey=${route.sessionKey}`);
+  try {
   await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: ctxPayload,
     cfg: config,
@@ -490,6 +538,12 @@ async function processMessage(
     replyOptions: { onModelSelected },
   });
   runtime.log?.(`[fluffle] dispatchReply completed for groupId=${message.groupId}`);
+  } catch (dispatchErr) {
+    runtime.error?.(`[fluffle] dispatchReply CRASHED: ${String(dispatchErr)}`);
+    if (dispatchErr instanceof Error && dispatchErr.stack) {
+      runtime.error?.(`[fluffle] dispatchReply stack: ${dispatchErr.stack}`);
+    }
+  }
 
   // Cleanup typing interval
   if (typingInterval) { clearInterval(typingInterval); typingInterval = null; }
@@ -510,20 +564,23 @@ async function deliverReply(params: {
   const { payload, groupId, runtime, core, config, accountId, statusSink, streamApi } = params;
   const text = payload.text ?? "";
 
-  const sentMedia = await sendMediaWithLeadingCaption({
-    mediaUrls: resolveOutboundMediaUrls(payload),
-    caption: text,
-    send: async ({ caption }) => {
-      if (caption) {
-        await sendMessageFluffle(groupId, caption);
-        statusSink?.({ lastOutboundAt: Date.now() });
-      }
-    },
-    onError: (error) => {
-      runtime.error(`fluffle media send failed: ${String(error)}`);
-    },
-  });
-  if (sentMedia) return;
+  // Handle media if SDK functions are available
+  if (typeof sendMediaWithLeadingCaption === 'function' && typeof resolveOutboundMediaUrls === 'function') {
+    const sentMedia = await sendMediaWithLeadingCaption({
+      mediaUrls: resolveOutboundMediaUrls(payload),
+      caption: text,
+      send: async ({ caption }: { caption: string }) => {
+        if (caption) {
+          await sendMessageFluffle(groupId, caption);
+          statusSink?.({ lastOutboundAt: Date.now() });
+        }
+      },
+      onError: (error: unknown) => {
+        runtime.error(`fluffle media send failed: ${String(error)}`);
+      },
+    });
+    if (sentMedia) return;
+  }
 
   if (text && streamApi) {
     // Stream the final response text via Fluffle's streaming API
@@ -1044,11 +1101,12 @@ async function startSocketIOListener(
   // Dynamic import socket.io-client
   const { io } = await import("socket.io-client");
 
-  const socket = io(socketUrl, {
+  const socket = io(socketUrl + '/chat', {
     path: "/socket.io",
     transports: ["polling", "websocket"],
+    auth: { token: apiKey },
     extraHeaders: {
-      Authorization: `Bearer ${apiKey}`,
+      'x-api-key': apiKey,
     },
     reconnection: true,
     reconnectionAttempts: Infinity,
@@ -1348,6 +1406,7 @@ export async function monitorFluffle(
   };
 
   const transport = account.config.transport ?? "webhook";
+  runtime.log?.(`[fluffle] monitorFluffle: transport=${transport}, accountId=${account.accountId}, config.transport=${account.config.transport}, config keys=${Object.keys(account.config).join(',')}`);
 
   if (transport === "socketio") {
     runtime.log?.(`[fluffle] Starting Socket.IO transport`);
@@ -1401,3 +1460,6 @@ export async function monitorFluffle(
 
   return { stop };
 }
+
+// DEBUG MARKER - if this shows in logs, TS recompilation worked
+console.error("[FLUFFLE-DEBUG] monitor.ts loaded at", new Date().toISOString());
