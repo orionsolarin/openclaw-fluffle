@@ -417,16 +417,35 @@ async function processMessage(
   let resolvedMediaUrl = fileMediaUrl;
   let resolvedMediaType = fileMediaType;
   if (message.fileId && fileMediaUrl) {
-    try {
-      const resp = await fetch(fileMediaUrl, { headers: { Authorization: `Bearer ${account.config.apiKey}` } });
-      if (resp.ok) {
-        const ct = resp.headers.get("content-type") || fileMediaType || "application/octet-stream";
-        const buf = await resp.arrayBuffer();
-        const b64 = Buffer.from(buf).toString("base64");
-        resolvedMediaUrl = `data:${ct};base64,${b64}`;
-        resolvedMediaType = ct;
+    const fetchFile = async (): Promise<boolean> => {
+      try {
+        const resp = await fetch(fileMediaUrl, { headers: { Authorization: `Bearer ${account.config.apiKey}` } });
+        if (resp.ok) {
+          const ct = resp.headers.get("content-type") || fileMediaType || "application/octet-stream";
+          const buf = await resp.arrayBuffer();
+          const b64 = Buffer.from(buf).toString("base64");
+          resolvedMediaUrl = `data:${ct};base64,${b64}`;
+          resolvedMediaType = ct;
+          return true;
+        }
+        return false;
+      } catch {
+        return false;
       }
-    } catch {}
+    };
+
+    if (!await fetchFile()) {
+      // File may not be ready yet — retry after a short delay
+      runtime.log?.(`[fluffle] File fetch failed for ${message.fileId}, retrying in 2s...`);
+      await new Promise(r => setTimeout(r, 2000));
+      if (!await fetchFile()) {
+        runtime.log?.(`[fluffle] File fetch retry 2 failed for ${message.fileId}, retrying in 3s...`);
+        await new Promise(r => setTimeout(r, 3000));
+        if (!await fetchFile()) {
+          runtime.log?.(`[fluffle] File fetch failed after 3 attempts for ${message.fileId}`);
+        }
+      }
+    }
   }
 
   // Build participants list from teammates
